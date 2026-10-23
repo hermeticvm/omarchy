@@ -70,3 +70,34 @@ last_poll_line=$(rg -n '^omarchy-shell lock status$' "$secure_log" | tail -1 | c
 (( last_poll_line < first_pkill_line )) ||
   fail "system lock tears the screensaver down only after the lock is secure" "last poll: $last_poll_line, first pkill: $first_pkill_line"
 pass "system lock waits for a secure lock before tearing the screensaver down"
+
+# A shell that accepts the lock and then stalls must not stretch the wait to
+# ten status timeouts: the lid-close caller runs this script synchronously,
+# so the deadline, not a poll count, bounds it.
+slow_log="$tmpdir/calls-slow"
+slow_start_ms=$((10#${EPOCHREALTIME//[!0-9]/} / 1000))
+
+cat >"$mock_bin/omarchy-shell" <<'SH'
+#!/bin/bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"$CALL_LOG"
+if [[ $* == "lock lock" ]]; then
+  echo ok
+elif [[ $* == "lock status" ]]; then
+  sleep "$OMARCHY_SHELL_IPC_TIMEOUT"
+  echo '{"secure":false}'
+fi
+SH
+chmod +x "$mock_bin/omarchy-shell"
+
+PATH="$mock_bin:$PATH" CALL_LOG="$slow_log" "$ROOT/bin/omarchy-system-lock"
+slow_elapsed_ms=$((10#${EPOCHREALTIME//[!0-9]/} / 1000 - slow_start_ms))
+mapfile -t slow_polls < <(rg '^omarchy-shell lock status$' "$slow_log")
+mapfile -t slow_shutdown < <(rg '^(pkill|timeout) ' "$slow_log")
+
+[[ ${#slow_polls[@]} -le 2 ]] ||
+  fail "system lock stops polling a stalled shell" "polls: ${#slow_polls[@]}"
+[[ ${#slow_shutdown[@]} == 3 ]] ||
+  fail "system lock still tears the screensaver down after a stalled shell" "calls: ${slow_shutdown[*]}"
+(( slow_elapsed_ms < 3000 )) ||
+  fail "system lock bounds a stalled shell" "elapsed: ${slow_elapsed_ms}ms"
+pass "system lock bounds a stalled shell by the deadline"
